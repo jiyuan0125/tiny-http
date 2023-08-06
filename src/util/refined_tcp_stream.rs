@@ -1,6 +1,9 @@
 use std::io::Result as IoResult;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr};
+use std::ptr::NonNull;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU8;
 
 use crate::connection::Connection;
 #[cfg(any(
@@ -119,10 +122,14 @@ impl Write for Stream {
 }
 
 pub struct RefinedTcpStream {
-    stream: Stream,
+    stream: NonNull<Stream>,
     close_read: bool,
     close_write: bool,
+    stream_counter: Arc<AtomicU8>,
 }
+
+unsafe impl Sync for RefinedTcpStream {}
+unsafe impl Send for RefinedTcpStream {}
 
 impl RefinedTcpStream {
     pub(crate) fn new<S>(stream: S) -> (RefinedTcpStream, RefinedTcpStream)
@@ -130,19 +137,26 @@ impl RefinedTcpStream {
         S: Into<Stream>,
     {
         let stream: Stream = stream.into();
+        let stream_ptr = Box::into_raw(Box::new(stream));
+        let stream_non_null = unsafe {
+            NonNull::new_unchecked(stream_ptr)
+        };
 
-        let (read, write) = (stream.clone(), stream);
+        let (read, write) = (stream_non_null.clone(), stream_non_null);
+        let stream_counter = Arc::new(AtomicU8::new(2));
 
         let read = RefinedTcpStream {
             stream: read,
             close_read: true,
             close_write: false,
+            stream_counter: stream_counter.clone(),
         };
 
         let write = RefinedTcpStream {
             stream: write,
             close_read: false,
             close_write: true,
+            stream_counter
         };
 
         (read, write)
@@ -151,38 +165,44 @@ impl RefinedTcpStream {
     /// Returns true if this struct wraps around a secure connection.
     #[inline]
     pub(crate) fn secure(&self) -> bool {
-        self.stream.secure()
+        unsafe { self.stream.as_ref().secure() }
     }
 
     pub(crate) fn peer_addr(&mut self) -> IoResult<Option<SocketAddr>> {
-        self.stream.peer_addr()
+        unsafe { self.stream.as_mut().peer_addr() }
     }
 }
 
 impl Drop for RefinedTcpStream {
     fn drop(&mut self) {
         if self.close_read {
-            self.stream.shutdown(Shutdown::Read).ok();
+            unsafe { self.stream.as_mut().shutdown(Shutdown::Read).ok() };
+            self.stream_counter.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         }
 
         if self.close_write {
-            self.stream.shutdown(Shutdown::Write).ok();
+            unsafe { self.stream.as_mut().shutdown(Shutdown::Write).ok() };
+            self.stream_counter.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+
+        if self.stream_counter.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            unsafe { let _stream = Box::from_raw(self.stream.as_ptr()); }
         }
     }
 }
 
 impl Read for RefinedTcpStream {
     fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
-        self.stream.read(buf)
+        unsafe { self.stream.as_mut().read(buf) }
     }
 }
 
 impl Write for RefinedTcpStream {
     fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
-        self.stream.write(buf)
+        unsafe { self.stream.as_mut().write(buf) }
     }
 
     fn flush(&mut self) -> IoResult<()> {
-        self.stream.flush()
+        unsafe { self.stream.as_mut().flush() }
     }
 }
