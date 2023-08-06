@@ -1,6 +1,7 @@
 use std::io::Result as IoResult;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr};
+use std::sync::{Mutex, Arc};
 
 use crate::connection::Connection;
 #[cfg(any(
@@ -119,7 +120,7 @@ impl Write for Stream {
 }
 
 pub struct RefinedTcpStream {
-    stream: Stream,
+    stream: Arc<Mutex<Stream>>,
     close_read: bool,
     close_write: bool,
 }
@@ -130,17 +131,16 @@ impl RefinedTcpStream {
         S: Into<Stream>,
     {
         let stream: Stream = stream.into();
-
-        let (read, write) = (stream.clone(), stream);
+        let stream = Arc::new(Mutex::new(stream));
 
         let read = RefinedTcpStream {
-            stream: read,
+            stream: stream.clone() ,
             close_read: true,
             close_write: false,
         };
 
         let write = RefinedTcpStream {
-            stream: write,
+            stream: stream,
             close_read: false,
             close_write: true,
         };
@@ -151,38 +151,38 @@ impl RefinedTcpStream {
     /// Returns true if this struct wraps around a secure connection.
     #[inline]
     pub(crate) fn secure(&self) -> bool {
-        self.stream.secure()
+        self.stream.lock().unwrap().secure()
     }
 
     pub(crate) fn peer_addr(&mut self) -> IoResult<Option<SocketAddr>> {
-        self.stream.peer_addr()
+        self.stream.lock().unwrap().peer_addr()
     }
 }
 
 impl Drop for RefinedTcpStream {
     fn drop(&mut self) {
         if self.close_read {
-            self.stream.shutdown(Shutdown::Read).ok();
+            self.stream.lock().unwrap().shutdown(Shutdown::Read).ok();
         }
 
         if self.close_write {
-            self.stream.shutdown(Shutdown::Write).ok();
+            self.stream.lock().unwrap().shutdown(Shutdown::Write).ok();
         }
     }
 }
 
 impl Read for RefinedTcpStream {
     fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
-        self.stream.read(buf)
+        self.stream.lock().unwrap().read(buf)
     }
 }
 
 impl Write for RefinedTcpStream {
     fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
-        self.stream.write(buf)
+        self.stream.lock().unwrap().write(buf)
     }
 
     fn flush(&mut self) -> IoResult<()> {
-        self.stream.flush()
+        self.stream.lock().unwrap().flush()
     }
 }
